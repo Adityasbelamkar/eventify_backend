@@ -8,15 +8,19 @@ import dotenv from "dotenv";
 dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 5000;
-const HOST = process.env.HOST || "127.0.0.1";
+
+// --- Config (Render provides PORT) ---
+const PORT = process.env.PORT || 8080;
 const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/eventify";
+
+// If running behind a proxy/load balancer (Render), enable this so IPs are detected correctly
+app.set("trust proxy", 1);
 
 // ---------- Security & middleware ----------
 app.use(helmet());
 app.use(express.json({ limit: "10kb" }));
 
-// CORS: allow all by default (works when opening main.html from filesystem)
+// CORS: allow list via env, or allow all (*) if not set
 const allowed = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map(s => s.trim())
@@ -25,11 +29,11 @@ const allowed = (process.env.ALLOWED_ORIGINS || "")
 app.use(
   cors({
     origin: (origin, cb) => {
-      if (!origin) return cb(null, true); // allow same-origin / file://
+      if (!origin) return cb(null, true); // same-origin / server-to-server
       if (allowed.length === 0 || allowed.includes(origin)) return cb(null, true);
       return cb(new Error("Not allowed by CORS"));
     },
-    credentials: false
+    credentials: false,
   })
 );
 
@@ -62,10 +66,10 @@ const bookingSchema = new mongoose.Schema(
       maxlength: 200,
       validate: {
         validator: v => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v),
-        message: "Invalid email format"
-      }
+        message: "Invalid email format",
+      },
     },
-    status: { type: String, enum: ["confirmed", "cancelled"], default: "confirmed" }
+    status: { type: String, enum: ["confirmed", "cancelled"], default: "confirmed" },
   },
   { timestamps: true }
 );
@@ -76,14 +80,18 @@ const Booking = mongoose.model("Booking", bookingSchema);
 const sanitizeTitle = s => (s || "").toString().trim().slice(0, 200);
 
 // ---------- Routes ----------
-app.get("/api/health", (req, res) => {
+app.get("/", (_req, res) => {
+  // Simple root for Render health checks/manual ping
+  res.json({ ok: true, service: "eventify-backend", time: new Date().toISOString() });
+});
+
+app.get("/api/health", (_req, res) => {
   res.json({ ok: true, time: new Date().toISOString() });
 });
 
 /**
  * POST /api/book
  * body: { eventTitle, userEmail }
- * returns: { ok: true, booking }
  */
 app.post("/api/book", async (req, res) => {
   try {
@@ -107,7 +115,6 @@ app.post("/api/book", async (req, res) => {
 
 /**
  * GET /api/bookings?userEmail=...
- * returns: Booking[]
  */
 app.get("/api/bookings", async (req, res) => {
   try {
@@ -116,11 +123,7 @@ app.get("/api/bookings", async (req, res) => {
       return res.status(400).json({ ok: false, error: "userEmail query param is required" });
     }
     const list = await Booking.find({ userEmail }).sort({ createdAt: -1 }).lean();
-    // The frontend expects a `date` field; map createdAt -> date for compatibility
-    const shaped = list.map(b => ({
-      ...b,
-      date: b.createdAt,
-    }));
+    const shaped = list.map(b => ({ ...b, date: b.createdAt }));
     res.json(shaped);
   } catch (err) {
     console.error(err);
@@ -129,9 +132,18 @@ app.get("/api/bookings", async (req, res) => {
 });
 
 // 404 fallback
-app.use((req, res) => res.status(404).json({ ok: false, error: "Not found" }));
+app.use((_req, res) => res.status(404).json({ ok: false, error: "Not found" }));
 
-// ---------- Start ----------
-app.listen(PORT, HOST, () => {
-  console.log(`🚀 Server running at http://${HOST}:${PORT}`);
+// ---------- Start (bind to 0.0.0.0 on Render) ----------
+app.listen(PORT, () => {
+  console.log(`🚀 Server listening on 0.0.0.0:${PORT}`);
+});
+
+// Graceful shutdown (optional)
+process.on("SIGTERM", () => {
+  console.log("🛑 SIGTERM received. Closing server...");
+  mongoose.connection.close(false, () => {
+    console.log("🔌 Mongo connection closed.");
+    process.exit(0);
+  });
 });
