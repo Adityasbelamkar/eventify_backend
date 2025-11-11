@@ -13,14 +13,13 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/eventify";
 
-// If running behind a proxy/load balancer (Render), enable this so IPs are detected correctly
 app.set("trust proxy", 1);
 
 // ---------- Security & middleware ----------
 app.use(helmet());
 app.use(express.json({ limit: "10kb" }));
 
-// CORS: allow list via env, or allow all (*) if not set
+// CORS: allowlist via env, or allow all if not set
 const allowed = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map(s => s.trim())
@@ -39,11 +38,7 @@ app.use(
   })
 );
 
-// Basic rate limits for API routes
-const limiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute
-  max: 100,
-});
+const limiter = rateLimit({ windowMs: 60 * 1000, max: 100 });
 app.use("/api/", limiter);
 
 // ---------- DB ----------
@@ -57,8 +52,23 @@ mongoose
   });
 
 // ---------- Models ----------
+const eventSchema = new mongoose.Schema(
+  {
+    title: { type: String, required: true, trim: true, maxlength: 200 },
+    city: { type: String, required: true, trim: true, maxlength: 100 },
+    date: { type: String, required: true, trim: true }, // yyyy-mm-dd
+    price: { type: Number, required: true, min: 0 },
+    venue: { type: String, required: true, trim: true, maxlength: 200 },
+    image: { type: String, trim: true, maxlength: 500 },
+    description: { type: String, trim: true, maxlength: 1000 },
+    status: { type: String, enum: ["active", "deleted"], default: "active" }, // soft delete
+  },
+  { timestamps: true }
+);
+
 const bookingSchema = new mongoose.Schema(
   {
+    eventId: { type: mongoose.Schema.Types.ObjectId, ref: "Event" }, // optional but useful
     eventTitle: { type: String, required: true, trim: true, maxlength: 200 },
     userEmail: {
       type: String,
@@ -77,6 +87,7 @@ const bookingSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+const Event = mongoose.model("Event", eventSchema);
 const Booking = mongoose.model("Booking", bookingSchema);
 
 // ---------- Helpers ----------
@@ -98,7 +109,6 @@ const pickQuantity = body =>
 
 // ---------- Routes ----------
 app.get("/", (_req, res) => {
-  // Simple root for Render health checks/manual ping
   res.json({ ok: true, service: "eventify-backend", time: new Date().toISOString() });
 });
 
@@ -106,15 +116,73 @@ app.get("/api/health", (_req, res) => {
   res.json({ ok: true, time: new Date().toISOString() });
 });
 
-/**
- * POST /api/book
- * body: { eventTitle, userEmail, quantity? } (quantity aliases accepted)
- */
+/* ===== Events ===== */
+
+// GET /api/events  (list active)
+app.get("/api/events", async (_req, res) => {
+  try {
+    const list = await Event.find({ status: "active" }).sort({ date: 1 }).lean();
+    res.json(list);
+  } catch (e) {
+    console.error("GET /api/events", e);
+    res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
+// POST /api/events  (create)
+app.post("/api/events", async (req, res) => {
+  try {
+    const { title, city, date, price, venue, image = "", description = "" } = req.body || {};
+    if (!title || !city || !date || price == null || !venue) {
+      return res.status(400).json({ ok: false, error: "title, city, date, price, venue required" });
+    }
+    const doc = await Event.create({ title, city, date, price, venue, image, description });
+    res.status(201).json({ ok: true, event: doc });
+  } catch (e) {
+    console.error("POST /api/events", e);
+    res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
+// DELETE /api/events/:id?mode=soft|hard
+app.delete("/api/events/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const mode = (req.query.mode || "soft").toLowerCase();
+
+    const ev = await Event.findById(id);
+    if (!ev || ev.status === "deleted") {
+      return res.status(404).json({ ok: false, error: "Event not found" });
+    }
+
+    if (mode === "hard") {
+      await Event.deleteOne({ _id: id });
+      await Booking.deleteMany({ $or: [{ eventId: id }, { eventTitle: ev.title }] });
+      return res.json({ ok: true, deleted: "hard", eventId: id });
+    } else {
+      ev.status = "deleted";
+      await ev.save();
+      await Booking.updateMany(
+        { $or: [{ eventId: id }, { eventTitle: ev.title }], status: { $ne: "cancelled" } },
+        { $set: { status: "cancelled" } }
+      );
+      return res.json({ ok: true, deleted: "soft", eventId: id });
+    }
+  } catch (e) {
+    console.error("DELETE /api/events/:id", e);
+    res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
+/* ===== Bookings ===== */
+
+// POST /api/book  body: { eventTitle, userEmail, eventId?, quantity? (aliases ok) }
 app.post("/api/book", async (req, res) => {
   try {
     const eventTitle = sanitizeTitle(req.body?.eventTitle);
     const userEmail = (req.body?.userEmail || "").toLowerCase().trim();
     const quantity = pickQuantity(req.body);
+    const eventId = req.body?.eventId ? String(req.body.eventId) : undefined;
 
     if (!eventTitle || !userEmail) {
       return res.status(400).json({ ok: false, error: "eventTitle and userEmail are required" });
@@ -123,7 +191,7 @@ app.post("/api/book", async (req, res) => {
       return res.status(400).json({ ok: false, error: "Invalid email" });
     }
 
-    const booking = await Booking.create({ eventTitle, userEmail, quantity });
+    const booking = await Booking.create({ eventTitle, userEmail, quantity, eventId });
     res.status(201).json({ ok: true, booking });
   } catch (err) {
     console.error("POST /api/book error:", err);
@@ -131,11 +199,7 @@ app.post("/api/book", async (req, res) => {
   }
 });
 
-/**
- * GET /api/bookings?userEmail=...
- * Returns array of bookings for the user.
- * Each item includes: _id, eventTitle, userEmail, quantity, status, date (alias of createdAt)
- */
+// GET /api/bookings?userEmail=...
 app.get("/api/bookings", async (req, res) => {
   try {
     const userEmail = (req.query.userEmail || "").toLowerCase().trim();
@@ -143,8 +207,9 @@ app.get("/api/bookings", async (req, res) => {
       return res.status(400).json({ ok: false, error: "userEmail query param is required" });
     }
     const list = await Booking.find({ userEmail }).sort({ createdAt: -1 }).lean();
-    const shaped = list.map(({ _id, eventTitle, userEmail, quantity, status, createdAt }) => ({
+    const shaped = list.map(({ _id, eventId, eventTitle, userEmail, quantity, status, createdAt }) => ({
       _id,
+      eventId,
       eventTitle,
       userEmail,
       quantity,
@@ -159,18 +224,11 @@ app.get("/api/bookings", async (req, res) => {
   }
 });
 
-/**
- * DELETE /api/booking/:id
- * Soft-cancels a booking by id (sets status = "cancelled")
- */
+// DELETE /api/booking/:id  (soft cancel by id)
 app.delete("/api/booking/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const doc = await Booking.findByIdAndUpdate(
-      id,
-      { $set: { status: "cancelled" } },
-      { new: true }
-    );
+    const doc = await Booking.findByIdAndUpdate(id, { $set: { status: "cancelled" } }, { new: true });
     if (!doc) return res.status(404).json({ ok: false, error: "Booking not found" });
     res.json({ ok: true, booking: doc });
   } catch (err) {
@@ -179,10 +237,7 @@ app.delete("/api/booking/:id", async (req, res) => {
   }
 });
 
-/**
- * DELETE /api/booking?bookingId=... OR ?userEmail=...&eventTitle=...
- * Alternate delete for clients that pass query instead of path param.
- */
+// DELETE /api/booking?bookingId=... OR ?userEmail=&eventTitle=
 app.delete("/api/booking", async (req, res) => {
   try {
     const bookingId = req.query.bookingId?.toString().trim();
@@ -190,22 +245,16 @@ app.delete("/api/booking", async (req, res) => {
     const eventTitle = sanitizeTitle(req.query.eventTitle);
 
     let filter = null;
-    if (bookingId) {
-      filter = { _id: bookingId };
-    } else if (userEmail && eventTitle) {
-      filter = { userEmail, eventTitle, status: { $ne: "cancelled" } };
-    } else {
+    if (bookingId) filter = { _id: bookingId };
+    else if (userEmail && eventTitle) filter = { userEmail, eventTitle, status: { $ne: "cancelled" } };
+    else {
       return res.status(400).json({
         ok: false,
         error: "Provide bookingId or (userEmail and eventTitle) to cancel",
       });
     }
 
-    const doc = await Booking.findOneAndUpdate(
-      filter,
-      { $set: { status: "cancelled" } },
-      { new: true }
-    );
+    const doc = await Booking.findOneAndUpdate(filter, { $set: { status: "cancelled" } }, { new: true });
     if (!doc) return res.status(404).json({ ok: false, error: "Booking not found" });
 
     res.json({ ok: true, booking: doc });
@@ -215,11 +264,7 @@ app.delete("/api/booking", async (req, res) => {
   }
 });
 
-/**
- * POST /api/cancel
- * body: { bookingId } OR { userEmail, eventTitle }
- * Soft-cancel (status="cancelled").
- */
+// POST /api/cancel  body: { bookingId } OR { userEmail, eventTitle }
 app.post("/api/cancel", async (req, res) => {
   try {
     const bookingId = (req.body?.bookingId || req.body?._id || req.body?.id || "").toString().trim();
@@ -227,22 +272,16 @@ app.post("/api/cancel", async (req, res) => {
     const eventTitle = sanitizeTitle(req.body?.eventTitle);
 
     let filter = null;
-    if (bookingId) {
-      filter = { _id: bookingId };
-    } else if (userEmail && eventTitle) {
-      filter = { userEmail, eventTitle, status: { $ne: "cancelled" } };
-    } else {
+    if (bookingId) filter = { _id: bookingId };
+    else if (userEmail && eventTitle) filter = { userEmail, eventTitle, status: { $ne: "cancelled" } };
+    else {
       return res.status(400).json({
         ok: false,
         error: "Provide bookingId or (userEmail and eventTitle) to cancel",
       });
     }
 
-    const doc = await Booking.findOneAndUpdate(
-      filter,
-      { $set: { status: "cancelled" } },
-      { new: true }
-    );
+    const doc = await Booking.findOneAndUpdate(filter, { $set: { status: "cancelled" } }, { new: true });
     if (!doc) return res.status(404).json({ ok: false, error: "Booking not found" });
 
     res.json({ ok: true, booking: doc });
@@ -255,12 +294,11 @@ app.post("/api/cancel", async (req, res) => {
 // 404 fallback
 app.use((_req, res) => res.status(404).json({ ok: false, error: "Not found" }));
 
-// ---------- Start (bind to 0.0.0.0 on Render) ----------
+// ---------- Start ----------
 app.listen(PORT, () => {
   console.log(`🚀 Server listening on 0.0.0.0:${PORT}`);
 });
 
-// Graceful shutdown (optional)
 process.on("SIGTERM", () => {
   console.log("🛑 SIGTERM received. Closing server...");
   mongoose.connection.close(false, () => {
