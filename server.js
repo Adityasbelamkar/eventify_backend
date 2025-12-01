@@ -20,24 +20,14 @@ app.set("trust proxy", 1);
 app.use(helmet());
 app.use(express.json({ limit: "10kb" }));
 
-// CORS: allow list via env, or allow all (*) if not set
-const allowed = (process.env.ALLOWED_ORIGINS || "")
-  .split(",")
-  .map(s => s.trim())
-  .filter(Boolean);
-
 app.use(
   cors({
-    origin: (origin, cb) => {
-      if (!origin) return cb(null, true); // same-origin / server-to-server
-      if (allowed.length === 0 || allowed.includes(origin)) return cb(null, true);
-      return cb(new Error("Not allowed by CORS"));
-    },
+    origin: "*", // allow all origins
     methods: ["GET", "POST", "DELETE", "PUT", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
-    credentials: false,
   })
 );
+
 
 // Basic rate limits for API routes
 const limiter = rateLimit({
@@ -268,3 +258,4 @@ process.on("SIGTERM", () => {
     process.exit(0);
   });
 });
+
